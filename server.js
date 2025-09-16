@@ -1,26 +1,62 @@
+// server.js
 import express from "express";
 import fetch from "node-fetch";
 import jwt from "jsonwebtoken";
+import { Redis } from "@upstash/redis";
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
-// ----- CONFIG (from env) -----
-const SLACK_CLIENT_ID = process.env.SLACK_CLIENT_ID;
-const SLACK_CLIENT_SECRET = process.env.SLACK_CLIENT_SECRET;
-const JWT_SECRET = process.env.JWT_SECRET;          // make a long random string
-const TOKEN_TTL_SECONDS = 60 * 60 * 24 * 7;         // 7 days
+// ---------- CONFIG ----------
+const {
+  SLACK_CLIENT_ID,
+  SLACK_CLIENT_SECRET,
+  JWT_SECRET,                 // make this a long random string
+  ADMIN_KEY = "",             // optional: for /admin/users
+  UPSTASH_REDIS_REST_URL,
+  UPSTASH_REDIS_REST_TOKEN,
+  PORT
+} = process.env;
 
-// ----- OAuth: ChatGPT will call our Token URL with the Slack "code" -----
+const TOKEN_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
+
+// Optional: persistent store (survives redeploys) — falls back to in-memory if not set
+const redis = (UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN)
+  ? new Redis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN })
+  : null;
+
+// In-memory cache of authorized users (ephemeral; resets on cold start)
+const USERS = new Map(); // key = `${team_id}:${user_id}` -> { connected_at, last_seen, team_id, team, user_id, user }
+
+// ---------- HELPERS ----------
+const nowISO = () => new Date().toISOString();
+const userKey = (team_id, user_id) => `user:${team_id}:${user_id}`;
+
+// ---------- OAUTH: AUTHORIZATION (for GPT "Authorization URL") ----------
+app.get("/oauth/authorize", (req, res) => {
+  // ChatGPT calls this; we bounce the user to Slack with the proper user_scope.
+  const { redirect_uri, state } = req.query;
+  const u = new URL("https://slack.com/oauth/v2/authorize");
+  u.searchParams.set("client_id", SLACK_CLIENT_ID);
+  u.searchParams.set(
+    "user_scope",
+    "search:read,channels:history,groups:history,im:history,mpim:history"
+  );
+  if (redirect_uri) u.searchParams.set("redirect_uri", redirect_uri);
+  if (state) u.searchParams.set("state", state);
+  return res.redirect(u.toString());
+});
+
+// ---------- OAUTH: TOKEN (for GPT "Token URL") ----------
 app.post("/oauth/token", async (req, res) => {
-  // ChatGPT sends: grant_type=authorization_code, code, redirect_uri
+  // ChatGPT posts: grant_type=authorization_code, code, redirect_uri
   const { code, redirect_uri } = req.body || {};
   if (!code || !redirect_uri) {
     return res.status(400).json({ error: "missing code or redirect_uri" });
   }
 
-  // Exchange with Slack for a USER token (xoxp-…)
+  // 1) Exchange code -> USER token (xoxp-…)
   const slackResp = await fetch("https://slack.com/api/oauth.v2.access", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -32,19 +68,66 @@ app.post("/oauth/token", async (req, res) => {
     })
   }).then(r => r.json());
 
-  const userToken = slackResp?.authed_user?.access_token;
-  if (!slackResp.ok || !userToken) {
+  const ok = slackResp && slackResp.ok === true;
+  const userToken = slackResp?.authed_user?.access_token; // xoxp-...
+  if (!ok || !userToken) {
     return res.status(400).json({ error: "slack_oauth_failed", details: slackResp });
   }
 
-  // Mint a JWT so ChatGPT never sees the raw Slack token
+  // 2) Identify the user/team (no extra scopes required)
+  const idResp = await fetch("https://slack.com/api/auth.test", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${userToken}`,
+      "Content-Type": "application/x-www-form-urlencoded"
+    },
+    body: new URLSearchParams()
+  }).then(r => r.json());
+
+  if (!idResp?.ok) {
+    return res.status(400).json({ error: "auth_test_failed", details: idResp });
+  }
+
+  const { user_id, user, team_id, team } = idResp;
+  const key = `${team_id}:${user_id}`;
+  const kRedis = userKey(team_id, user_id);
+  const now = nowISO();
+
+  // 3) Update in-memory registry
+  if (!USERS.has(key)) {
+    USERS.set(key, { connected_at: now, last_seen: now, team_id, team, user_id, user });
+  } else {
+    USERS.get(key).last_seen = now;
+  }
+
+  // 4) Persist (if Redis configured)
+  if (redis) {
+    const exists = await redis.exists(kRedis);
+    if (!exists) {
+      await redis.hset(kRedis, { connected_at: now, team_id, team, user_id, user });
+    }
+    await redis.hset(kRedis, { last_seen: now });
+    await redis.sadd("users:index", kRedis);            // index of all users
+    // optional TTL (comment out if you want to keep forever)
+    await redis.expire(kRedis, 60 * 60 * 24 * 90);      // 90 days
+  }
+
+  console.log(`[AUTH] ${user} (${user_id}) on ${team} (${team_id}) connected at ${now}`);
+
+  // 5) Mint JWT including identity (so downstream requests know who it is)
   const access_token = jwt.sign(
-    { slack_user_token: userToken },
+    {
+      slack_user_token: userToken,
+      slack_user_id: user_id,
+      slack_team_id: team_id,
+      user,
+      team
+    },
     JWT_SECRET,
     { expiresIn: TOKEN_TTL_SECONDS }
   );
 
-  // Return a standard OAuth token payload
+  // 6) Standard OAuth token payload
   return res.json({
     access_token,
     token_type: "bearer",
@@ -52,21 +135,35 @@ app.post("/oauth/token", async (req, res) => {
   });
 });
 
-// ----- Auth middleware: verify our JWT and extract Slack user token -----
-function requireAuth(req, res, next) {
+// ---------- AUTH MIDDLEWARE ----------
+async function requireAuth(req, res, next) {
   const auth = req.headers.authorization || "";
   const bearer = auth.startsWith("Bearer ") ? auth.slice(7) : "";
   try {
     const decoded = jwt.verify(bearer, JWT_SECRET);
     req.slackUserToken = decoded.slack_user_token;
-    next();
+    req.identity = {
+      user_id: decoded.slack_user_id,
+      team_id: decoded.slack_team_id,
+      user: decoded.user,
+      team: decoded.team
+    };
+    const key = `${decoded.slack_team_id}:${decoded.slack_user_id}`;
+    const rec = USERS.get(key);
+    const t = nowISO();
+    if (rec) rec.last_seen = t;
+    if (redis) {
+      await redis.hset(userKey(decoded.slack_team_id, decoded.slack_user_id), { last_seen: t });
+    }
+    return next();
   } catch {
     return res.status(401).json({ error: "unauthorized" });
   }
 }
 
-// ----- API that the GPT calls -----
+// ---------- API CALLED BY GPT ----------
 app.get("/slack/search", requireAuth, async (req, res) => {
+  console.log(`[CALL] /slack/search by ${req.identity?.user} (${req.identity?.user_id})`);
   const q = req.query.q || "";
   const count = String(req.query.limit || 50);
   const resp = await fetch("https://slack.com/api/search.messages", {
@@ -77,22 +174,11 @@ app.get("/slack/search", requireAuth, async (req, res) => {
     },
     body: new URLSearchParams({ query: q, count, highlight: "true" })
   }).then(r => r.json());
-  res.json(resp);
+  return res.json(resp);
 });
 
-app.get("/oauth/authorize", (req, res) => {
-    const { redirect_uri, state } = req.query;
-    const u = new URL("https://slack.com/oauth/v2/authorize");
-    u.searchParams.set("client_id", SLACK_CLIENT_ID);
-    u.searchParams.set("user_scope", "search:read,channels:history,groups:history,im:history,mpim:history");
-    if (redirect_uri) u.searchParams.set("redirect_uri", redirect_uri);
-    if (state) u.searchParams.set("state", state);
-    res.redirect(u.toString());
-  });
-  
-
-  
 app.get("/slack/thread", requireAuth, async (req, res) => {
+  console.log(`[CALL] /slack/thread by ${req.identity?.user} (${req.identity?.user_id})`);
   const { channel, ts } = req.query;
   const limit = String(req.query.limit || 100);
   if (!channel || !ts) return res.status(400).json({ error: "missing channel or ts" });
@@ -104,8 +190,28 @@ app.get("/slack/thread", requireAuth, async (req, res) => {
     },
     body: new URLSearchParams({ channel, ts, limit })
   }).then(r => r.json());
-  res.json(resp);
+  return res.json(resp);
 });
 
+// ---------- ADMIN: who’s authorized (optional) ----------
+app.get("/admin/users", async (req, res) => {
+  if (!ADMIN_KEY || (req.headers["x-admin-key"] || "") !== ADMIN_KEY) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  if (redis) {
+    const keys = await redis.smembers("users:index");
+    const users = [];
+    for (const k of keys) {
+      const h = await redis.hgetall(k);
+      if (h) users.push(h);
+    }
+    return res.json({ users, persistent: true });
+  }
+  return res.json({ users: Array.from(USERS.values()), persistent: false });
+});
+
+// ---------- HEALTH ----------
 app.get("/", (_, res) => res.send("OK"));
-app.listen(process.env.PORT || 3000, () => console.log("proxy up"));
+
+// ---------- RUN ----------
+app.listen(PORT || 3000, () => console.log("proxy up"));
