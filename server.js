@@ -81,13 +81,15 @@ app.get("/slack/search", requireAuth, async (req, res) => {
 });
 
 app.get("/oauth/authorize", (req, res) => {
-    const redirect_uri = req.query.redirect_uri || "";
+    const { redirect_uri, state } = req.query;
     const u = new URL("https://slack.com/oauth/v2/authorize");
     u.searchParams.set("client_id", SLACK_CLIENT_ID);
     u.searchParams.set("user_scope", "search:read,channels:history,groups:history,im:history,mpim:history");
     if (redirect_uri) u.searchParams.set("redirect_uri", redirect_uri);
+    if (state) u.searchParams.set("state", state);
     res.redirect(u.toString());
   });
+  
 
   
 app.get("/slack/thread", requireAuth, async (req, res) => {
