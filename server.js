@@ -16,10 +16,15 @@ const {
   ADMIN_KEY = "",             // optional: for /admin/users
   UPSTASH_REDIS_REST_URL,
   UPSTASH_REDIS_REST_TOKEN,
+  // GitHub integration for CSV tracking
+  GITHUB_TOKEN,               // fine-grained PAT with Contents: Read+Write
+  GITHUB_OWNER,               // e.g. caleb5mathews
+  GITHUB_REPO,                // e.g. SlackGPT
   PORT
 } = process.env;
 
 const TOKEN_TTL_SECONDS = 60 * 60 * 24 * 7; // 7 days
+const CSV_FILE_PATH = "usage_stats.csv"; // CSV file in repo root
 
 // Optional: persistent store (survives redeploys) — falls back to in-memory if not set
 const redis = (UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN)
@@ -32,6 +37,139 @@ const USERS = new Map(); // key = `${team_id}:${user_id}` -> { connected_at, las
 // ---------- HELPERS ----------
 const nowISO = () => new Date().toISOString();
 const userKey = (team_id, user_id) => `user:${team_id}:${user_id}`;
+
+// ---------- GITHUB CSV FUNCTIONS ----------
+async function getFileFromGitHub(path) {
+  if (!GITHUB_TOKEN || !GITHUB_OWNER || !GITHUB_REPO) {
+    console.log("[CSV] GitHub not configured, skipping CSV tracking");
+    return null;
+  }
+  
+  try {
+    const response = await fetch(`https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${path}`, {
+      headers: {
+        'Authorization': `Bearer ${GITHUB_TOKEN}`,
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28'
+      }
+    });
+    
+    if (response.status === 404) {
+      return null; // File doesn't exist yet
+    }
+    
+    if (!response.ok) {
+      throw new Error(`GitHub API error: ${response.status}`);
+    }
+    
+    const data = await response.json();
+    return {
+      content: Buffer.from(data.content, 'base64').toString('utf-8'),
+      sha: data.sha
+    };
+  } catch (error) {
+    console.error('[CSV] Error reading from GitHub:', error.message);
+    return null;
+  }
+}
+
+async function updateFileInGitHub(path, content, sha = null) {
+  if (!GITHUB_TOKEN || !GITHUB_OWNER || !GITHUB_REPO) return;
+  
+  try {
+    const body = {
+      message: `Update usage stats - ${new Date().toISOString()}`,
+      content: Buffer.from(content).toString('base64')
+    };
+    
+    if (sha) {
+      body.sha = sha;
+    }
+    
+    const response = await fetch(`https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${path}`, {
+      method: 'PUT',
+      headers: {
+        'Authorization': `Bearer ${GITHUB_TOKEN}`,
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28',
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(body)
+    });
+    
+    if (!response.ok) {
+      throw new Error(`GitHub API error: ${response.status}`);
+    }
+    
+    console.log('[CSV] Successfully updated usage stats in GitHub');
+  } catch (error) {
+    console.error('[CSV] Error updating GitHub file:', error.message);
+  }
+}
+
+async function trackUserQuestion(userIdentity) {
+  try {
+    // Get current CSV
+    const file = await getFileFromGitHub(CSV_FILE_PATH);
+    let csvContent = '';
+    let userStats = new Map();
+    
+    // Parse existing CSV if it exists
+    if (file?.content) {
+      csvContent = file.content;
+      const lines = csvContent.trim().split('\n');
+      
+      // Skip header if it exists
+      const hasHeader = lines[0]?.includes('user_name') || lines[0]?.includes('team_name');
+      const dataLines = hasHeader ? lines.slice(1) : lines;
+      
+      for (const line of dataLines) {
+        if (line.trim()) {
+          const [userName, teamName, userId, teamId, questionsStr] = line.split(',').map(s => s.trim());
+          const questions = parseInt(questionsStr) || 0;
+          userStats.set(`${teamId}:${userId}`, {
+            userName,
+            teamName,
+            userId,
+            teamId,
+            questions
+          });
+        }
+      }
+    }
+    
+    // Update or add user
+    const userKey = `${userIdentity.team_id}:${userIdentity.user_id}`;
+    const existing = userStats.get(userKey);
+    
+    if (existing) {
+      existing.questions += 1;
+    } else {
+      userStats.set(userKey, {
+        userName: userIdentity.user,
+        teamName: userIdentity.team,
+        userId: userIdentity.user_id,
+        teamId: userIdentity.team_id,
+        questions: 1
+      });
+    }
+    
+    // Generate new CSV content
+    const header = 'user_name,team_name,user_id,team_id,questions\n';
+    const rows = Array.from(userStats.values())
+      .sort((a, b) => b.questions - a.questions) // Sort by question count desc
+      .map(user => `${user.userName},${user.teamName},${user.userId},${user.teamId},${user.questions}`)
+      .join('\n');
+    
+    const newContent = header + rows;
+    
+    // Update in GitHub
+    await updateFileInGitHub(CSV_FILE_PATH, newContent, file?.sha);
+    
+  } catch (error) {
+    console.error('[CSV] Error tracking user question:', error.message);
+  }
+}
 
 // ---------- OAUTH: AUTHORIZATION (for GPT "Authorization URL") ----------
 app.get("/oauth/authorize", (req, res) => {
@@ -164,6 +302,12 @@ async function requireAuth(req, res, next) {
 // ---------- API CALLED BY GPT ----------
 app.get("/slack/search", requireAuth, async (req, res) => {
   console.log(`[CALL] /slack/search by ${req.identity?.user} (${req.identity?.user_id})`);
+  
+  // Track this question in CSV (async, don't block the response)
+  trackUserQuestion(req.identity).catch(err => 
+    console.error('[CSV] Failed to track question:', err.message)
+  );
+  
   const q = req.query.q || "";
   const count = String(req.query.limit || 50);
   const resp = await fetch("https://slack.com/api/search.messages", {
