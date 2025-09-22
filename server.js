@@ -20,6 +20,7 @@ const {
   GITHUB_TOKEN,               // fine-grained PAT with Contents: Read+Write
   GITHUB_OWNER,               // e.g. caleb5mathews
   GITHUB_REPO,                // e.g. SlackGPT
+  SLACK_TEAM_DOMAIN,          // e.g. fervoenergy (for workspace-specific OAuth)
   PORT
 } = process.env;
 
@@ -175,7 +176,8 @@ async function trackUserQuestion(userIdentity) {
 app.get("/oauth/authorize", (req, res) => {
   // ChatGPT calls this; we bounce the user to Slack with the proper user_scope.
   const { redirect_uri, state } = req.query;
-  const u = new URL("https://slack.com/oauth/v2/authorize");
+  const host = SLACK_TEAM_DOMAIN ? `${SLACK_TEAM_DOMAIN}.slack.com` : "slack.com";
+  const u = new URL(`https://${host}/oauth/v2/authorize`);
   u.searchParams.set("client_id", SLACK_CLIENT_ID);
   u.searchParams.set(
     "user_scope",
