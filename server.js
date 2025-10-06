@@ -202,42 +202,20 @@ async function trackUserQuestion(userIdentity) {
 }
 
 // ---------- FIREBASE FUNCTIONS ----------
-async function streamQuestionToFirebase(userIdentity, searchQuery, searchResults) {
+async function trackUserActivityInFirebase(userIdentity) {
   if (!firestore) {
-    console.log('[FIREBASE] Firestore not initialized, skipping question streaming');
+    console.log('[FIREBASE] Firestore not initialized, skipping user tracking');
     return;
   }
   
   try {
-    const questionData = {
-      // User information
-      userId: userIdentity.user_id,
-      userName: userIdentity.user,
-      teamId: userIdentity.team_id,
-      teamName: userIdentity.team,
-      
-      // Question details
-      searchQuery: searchQuery || '',
-      timestamp: admin.firestore.FieldValue.serverTimestamp(),
-      
-      // Search results metadata
-      resultsCount: searchResults?.messages?.total || 0,
-      hasResults: (searchResults?.messages?.total || 0) > 0,
-      
-      // Additional metadata
-      userAgent: 'SlackGPT-Proxy',
-      source: 'chatgpt'
-    };
-    
-    // Add to questions collection
-    const questionRef = await firestore.collection('questions').add(questionData);
-    console.log(`[FIREBASE] Question streamed with ID: ${questionRef.id}`);
-    
-    // Update user stats
+    // Update user stats (this handles both new users and existing users)
     await updateUserStatsInFirebase(userIdentity);
     
+    console.log(`[FIREBASE] User activity tracked for ${userIdentity.user}`);
+    
   } catch (error) {
-    console.error('[FIREBASE] Error streaming question:', error.message);
+    console.error('[FIREBASE] Error tracking user activity:', error.message);
   }
 }
 
@@ -246,6 +224,12 @@ async function updateUserStatsInFirebase(userIdentity) {
   
   try {
     const userStatsRef = firestore.collection('userStats').doc(`${userIdentity.team_id}_${userIdentity.user_id}`);
+    
+    // Parse first and last name from the full name
+    const fullName = userIdentity.user || 'Unknown User';
+    const nameParts = fullName.trim().split(' ');
+    const firstName = nameParts[0] || 'Unknown';
+    const lastName = nameParts.length > 1 ? nameParts.slice(1).join(' ') : '';
     
     await firestore.runTransaction(async (transaction) => {
       const userStatsDoc = await transaction.get(userStatsRef);
@@ -257,23 +241,30 @@ async function updateUserStatsInFirebase(userIdentity) {
           questionCount: (currentData.questionCount || 0) + 1,
           lastQuestionAt: admin.firestore.FieldValue.serverTimestamp(),
           userName: userIdentity.user,
-          teamName: userIdentity.team
+          firstName: firstName,
+          lastName: lastName,
+          teamName: userIdentity.team,
+          lastSeen: admin.firestore.FieldValue.serverTimestamp()
         });
       } else {
         // Create new user
         transaction.set(userStatsRef, {
           userId: userIdentity.user_id,
           userName: userIdentity.user,
+          firstName: firstName,
+          lastName: lastName,
           teamId: userIdentity.team_id,
           teamName: userIdentity.team,
           questionCount: 1,
           firstQuestionAt: admin.firestore.FieldValue.serverTimestamp(),
-          lastQuestionAt: admin.firestore.FieldValue.serverTimestamp()
+          lastQuestionAt: admin.firestore.FieldValue.serverTimestamp(),
+          firstSeen: admin.firestore.FieldValue.serverTimestamp(),
+          lastSeen: admin.firestore.FieldValue.serverTimestamp()
         });
       }
     });
     
-    console.log(`[FIREBASE] User stats updated for ${userIdentity.user}`);
+    console.log(`[FIREBASE] User stats updated for ${firstName} ${lastName} (${userIdentity.user})`);
     
   } catch (error) {
     console.error('[FIREBASE] Error updating user stats:', error.message);
@@ -431,9 +422,9 @@ app.get("/slack/search", requireAuth, async (req, res) => {
     console.error('[CSV] Failed to track question:', err.message)
   );
   
-  // Stream question to Firebase (async, don't block the response)
-  streamQuestionToFirebase(req.identity, q, resp).catch(err => 
-    console.error('[FIREBASE] Failed to stream question:', err.message)
+  // Track user activity in Firebase (async, don't block the response)
+  trackUserActivityInFirebase(req.identity).catch(err => 
+    console.error('[FIREBASE] Failed to track user activity:', err.message)
   );
   
   return res.json(resp);

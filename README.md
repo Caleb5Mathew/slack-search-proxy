@@ -46,22 +46,22 @@ When GitHub environment variables are configured, the app automatically tracks u
 
 The file is automatically created and updated on each search query, sorted by question count (highest first).
 
-## Firebase Question Streaming
+## Firebase User Analytics
 
-When Firebase environment variables are configured, the app automatically streams all questions to Firestore with detailed metadata:
+When Firebase environment variables are configured, the app automatically tracks user activity and analytics in Firestore:
 
 ### Collections Created:
-- **`questions`** - Individual question records with:
-  - User information (ID, name, team)
-  - Search query text
-  - Timestamp
-  - Results metadata (count, success)
-  - Source tracking
+- **`userStats`** - User analytics and activity tracking with:
+  - **User Information**: firstName, lastName, userName, userId
+  - **Team Information**: teamName, teamId
+  - **Activity Metrics**: questionCount, firstQuestionAt, lastQuestionAt
+  - **Session Tracking**: firstSeen, lastSeen timestamps
 
-- **`userStats`** - Aggregated user statistics with:
-  - Total question count
-  - First and last question timestamps
-  - User and team information
+### What Gets Tracked:
+- ✅ **Who** is using the service (first name, last name, team)
+- ✅ **How many questions** each person has asked
+- ✅ **When** they first used it and last used it
+- ❌ **NOT** the actual question content (privacy-focused)
 
 ### Debug Endpoint:
 - `GET /debug/firebase` - Test Firebase connectivity (requires admin key)
