@@ -3,6 +3,7 @@ import express from "express";
 import fetch from "node-fetch";
 import jwt from "jsonwebtoken";
 import { Redis } from "@upstash/redis";
+import admin from "firebase-admin";
 
 const app = express();
 app.use(express.urlencoded({ extended: true }));
@@ -21,6 +22,10 @@ const {
   GITHUB_OWNER,               // e.g. caleb5mathews
   GITHUB_REPO,                // e.g. SlackGPT
   SLACK_TEAM_DOMAIN,          // e.g. fervoenergy (for workspace-specific OAuth)
+  // Firebase integration for question streaming
+  FIREBASE_PROJECT_ID,        // Your Firebase project ID
+  FIREBASE_PRIVATE_KEY,       // Firebase private key (with \n replaced with actual newlines)
+  FIREBASE_CLIENT_EMAIL,      // Firebase client email
   PORT
 } = process.env;
 
@@ -31,6 +36,30 @@ const CSV_FILE_PATH = "usage_stats.csv"; // CSV file in repo root
 const redis = (UPSTASH_REDIS_REST_URL && UPSTASH_REDIS_REST_TOKEN)
   ? new Redis({ url: UPSTASH_REDIS_REST_URL, token: UPSTASH_REDIS_REST_TOKEN })
   : null;
+
+// Firebase initialization
+let firestore = null;
+if (FIREBASE_PROJECT_ID && FIREBASE_PRIVATE_KEY && FIREBASE_CLIENT_EMAIL) {
+  try {
+    const serviceAccount = {
+      projectId: FIREBASE_PROJECT_ID,
+      privateKey: FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+      clientEmail: FIREBASE_CLIENT_EMAIL,
+    };
+    
+    admin.initializeApp({
+      credential: admin.credential.cert(serviceAccount),
+      projectId: FIREBASE_PROJECT_ID,
+    });
+    
+    firestore = admin.firestore();
+    console.log('[FIREBASE] Successfully initialized Firestore');
+  } catch (error) {
+    console.error('[FIREBASE] Failed to initialize:', error.message);
+  }
+} else {
+  console.log('[FIREBASE] Firebase not configured, skipping Firestore integration');
+}
 
 // In-memory cache of authorized users (ephemeral; resets on cold start)
 const USERS = new Map(); // key = `${team_id}:${user_id}` -> { connected_at, last_seen, team_id, team, user_id, user }
@@ -172,6 +201,85 @@ async function trackUserQuestion(userIdentity) {
   }
 }
 
+// ---------- FIREBASE FUNCTIONS ----------
+async function streamQuestionToFirebase(userIdentity, searchQuery, searchResults) {
+  if (!firestore) {
+    console.log('[FIREBASE] Firestore not initialized, skipping question streaming');
+    return;
+  }
+  
+  try {
+    const questionData = {
+      // User information
+      userId: userIdentity.user_id,
+      userName: userIdentity.user,
+      teamId: userIdentity.team_id,
+      teamName: userIdentity.team,
+      
+      // Question details
+      searchQuery: searchQuery || '',
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
+      
+      // Search results metadata
+      resultsCount: searchResults?.messages?.total || 0,
+      hasResults: (searchResults?.messages?.total || 0) > 0,
+      
+      // Additional metadata
+      userAgent: 'SlackGPT-Proxy',
+      source: 'chatgpt'
+    };
+    
+    // Add to questions collection
+    const questionRef = await firestore.collection('questions').add(questionData);
+    console.log(`[FIREBASE] Question streamed with ID: ${questionRef.id}`);
+    
+    // Update user stats
+    await updateUserStatsInFirebase(userIdentity);
+    
+  } catch (error) {
+    console.error('[FIREBASE] Error streaming question:', error.message);
+  }
+}
+
+async function updateUserStatsInFirebase(userIdentity) {
+  if (!firestore) return;
+  
+  try {
+    const userStatsRef = firestore.collection('userStats').doc(`${userIdentity.team_id}_${userIdentity.user_id}`);
+    
+    await firestore.runTransaction(async (transaction) => {
+      const userStatsDoc = await transaction.get(userStatsRef);
+      
+      if (userStatsDoc.exists) {
+        // Update existing user
+        const currentData = userStatsDoc.data();
+        transaction.update(userStatsRef, {
+          questionCount: (currentData.questionCount || 0) + 1,
+          lastQuestionAt: admin.firestore.FieldValue.serverTimestamp(),
+          userName: userIdentity.user,
+          teamName: userIdentity.team
+        });
+      } else {
+        // Create new user
+        transaction.set(userStatsRef, {
+          userId: userIdentity.user_id,
+          userName: userIdentity.user,
+          teamId: userIdentity.team_id,
+          teamName: userIdentity.team,
+          questionCount: 1,
+          firstQuestionAt: admin.firestore.FieldValue.serverTimestamp(),
+          lastQuestionAt: admin.firestore.FieldValue.serverTimestamp()
+        });
+      }
+    });
+    
+    console.log(`[FIREBASE] User stats updated for ${userIdentity.user}`);
+    
+  } catch (error) {
+    console.error('[FIREBASE] Error updating user stats:', error.message);
+  }
+}
+
 // ---------- OAUTH: AUTHORIZATION (for GPT "Authorization URL") ----------
 app.get("/oauth/authorize", (req, res) => {
   // ChatGPT calls this; we bounce the user to Slack with the proper user_scope.
@@ -305,13 +413,10 @@ async function requireAuth(req, res, next) {
 app.get("/slack/search", requireAuth, async (req, res) => {
   console.log(`[CALL] /slack/search by ${req.identity?.user} (${req.identity?.user_id})`);
   
-  // Track this question in CSV (async, don't block the response)
-  trackUserQuestion(req.identity).catch(err => 
-    console.error('[CSV] Failed to track question:', err.message)
-  );
-  
   const q = req.query.q || "";
   const count = String(req.query.limit || 50);
+  
+  // Make the Slack API call
   const resp = await fetch("https://slack.com/api/search.messages", {
     method: "POST",
     headers: {
@@ -320,6 +425,17 @@ app.get("/slack/search", requireAuth, async (req, res) => {
     },
     body: new URLSearchParams({ query: q, count, highlight: "true" })
   }).then(r => r.json());
+  
+  // Track this question in CSV (async, don't block the response)
+  trackUserQuestion(req.identity).catch(err => 
+    console.error('[CSV] Failed to track question:', err.message)
+  );
+  
+  // Stream question to Firebase (async, don't block the response)
+  streamQuestionToFirebase(req.identity, q, resp).catch(err => 
+    console.error('[FIREBASE] Failed to stream question:', err.message)
+  );
+  
   return res.json(resp);
 });
 
@@ -339,7 +455,7 @@ app.get("/slack/thread", requireAuth, async (req, res) => {
   return res.json(resp);
 });
 
-// ---------- ADMIN: who’s authorized (optional) ----------
+// ---------- ADMIN: who's authorized (optional) ----------
 app.get("/admin/users", async (req, res) => {
   if (!ADMIN_KEY || (req.headers["x-admin-key"] || "") !== ADMIN_KEY) {
     return res.status(401).json({ error: "unauthorized" });
@@ -354,6 +470,43 @@ app.get("/admin/users", async (req, res) => {
     return res.json({ users, persistent: true });
   }
   return res.json({ users: Array.from(USERS.values()), persistent: false });
+});
+
+// ---------- DEBUG: Firebase connectivity test ----------
+app.get("/debug/firebase", async (req, res) => {
+  if (!ADMIN_KEY || (req.headers["x-admin-key"] || "") !== ADMIN_KEY) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  
+  const debugInfo = {
+    firebaseConfigured: !!(FIREBASE_PROJECT_ID && FIREBASE_PRIVATE_KEY && FIREBASE_CLIENT_EMAIL),
+    firestoreInitialized: !!firestore,
+    projectId: FIREBASE_PROJECT_ID || 'not set',
+    clientEmail: FIREBASE_CLIENT_EMAIL || 'not set',
+    privateKeySet: !!FIREBASE_PRIVATE_KEY
+  };
+  
+  if (firestore) {
+    try {
+      // Test Firestore connectivity
+      const testDoc = await firestore.collection('_debug').doc('connectivity-test').set({
+        timestamp: admin.firestore.FieldValue.serverTimestamp(),
+        test: true
+      });
+      
+      debugInfo.connectivityTest = 'success';
+      debugInfo.testDocId = 'connectivity-test';
+      
+      // Clean up test doc
+      await firestore.collection('_debug').doc('connectivity-test').delete();
+      
+    } catch (error) {
+      debugInfo.connectivityTest = 'failed';
+      debugInfo.error = error.message;
+    }
+  }
+  
+  return res.json(debugInfo);
 });
 
 // ---------- HEALTH ----------

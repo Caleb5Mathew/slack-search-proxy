@@ -29,6 +29,11 @@ A ChatGPT-compatible OAuth proxy for Slack search with usage tracking.
 - `GITHUB_OWNER` - Your GitHub username (e.g. `caleb5mathews`)
 - `GITHUB_REPO` - Your repository name (e.g. `SlackGPT`)
 
+### Firebase Integration (Optional)
+- `FIREBASE_PROJECT_ID` - Your Firebase project ID
+- `FIREBASE_PRIVATE_KEY` - Firebase service account private key (with \n replaced with actual newlines)
+- `FIREBASE_CLIENT_EMAIL` - Firebase service account client email
+
 ## CSV Usage Tracking
 
 When GitHub environment variables are configured, the app automatically tracks usage in a `usage_stats.csv` file in your repository. The CSV contains:
@@ -40,6 +45,26 @@ When GitHub environment variables are configured, the app automatically tracks u
 - `questions` - Number of search queries made
 
 The file is automatically created and updated on each search query, sorted by question count (highest first).
+
+## Firebase Question Streaming
+
+When Firebase environment variables are configured, the app automatically streams all questions to Firestore with detailed metadata:
+
+### Collections Created:
+- **`questions`** - Individual question records with:
+  - User information (ID, name, team)
+  - Search query text
+  - Timestamp
+  - Results metadata (count, success)
+  - Source tracking
+
+- **`userStats`** - Aggregated user statistics with:
+  - Total question count
+  - First and last question timestamps
+  - User and team information
+
+### Debug Endpoint:
+- `GET /debug/firebase` - Test Firebase connectivity (requires admin key)
 
 ## Setup
 
@@ -55,4 +80,5 @@ The file is automatically created and updated on each search query, sorted by qu
 - `GET /slack/search` - Search Slack messages (requires auth)
 - `GET /slack/thread` - Get thread replies (requires auth)
 - `GET /admin/users` - View authorized users (requires admin key)
+- `GET /debug/firebase` - Test Firebase connectivity (requires admin key)
 - `GET /` - Health check 
